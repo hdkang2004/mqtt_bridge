@@ -8,15 +8,26 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 find_library(MOSQUITTO_LIB mosquitto REQUIRED)
 
-add_executable(mqtt_pub_node src/mqtt_pub_node.cpp)
-ament_target_dependencies(mqtt_pub_node rclcpp)
-target_link_libraries(mqtt_pub_node ${MOSQUITTO_LIB})
+#add_executable(mqtt_pub_node src/mqtt_pub_node.cpp)
+#ament_target_dependencies(mqtt_pub_node rclcpp)
+#target_link_libraries(mqtt_pub_node ${MOSQUITTO_LIB})
+
+add_executable(gps_to_mqtt_node src/gps_to_mqtt_node.cpp)
+ament_target_dependencies(gps_to_mqtt_node
+  rclcpp
+  std_msgs
+  sensor_msgs
+)
+target_link_libraries(gps_to_mqtt_node ${MOSQUITTO_LIB})
 
 install(TARGETS
-  mqtt_pub_node
+#  mqtt_pub_node
+  gps_to_mqtt_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
