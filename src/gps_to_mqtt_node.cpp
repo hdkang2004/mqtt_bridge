@@ -1,118 +1,215 @@
 #include <memory>
 #include <string>
 #include <sstream>
+#include <iomanip>
+#include <cmath>
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/nav_sat_fix.hpp"
+#include "geometry_msgs/msg/twist_with_covariance_stamped.hpp"
+#include "ublox_msgs/msg/nav_pvt.hpp"
+
 #include <mosquitto.h>
 
 class GpsToMqttNode : public rclcpp::Node
 {
 public:
   GpsToMqttNode()
-  : Node("gps_to_mqtt_node"), mosq_(nullptr)
+  : Node("gps_to_mqtt_node")
   {
-    broker_address_ = this->declare_parameter<std::string>("broker_address", "183.111.206.213");
-    broker_port_ = this->declare_parameter<int>("broker_port", 2219);
-    mqtt_topic_ = this->declare_parameter<std::string>("mqtt_topic", "status");
-    qos_level_ = this->declare_parameter<int>("qos_level", 0);
-    client_id_ = this->declare_parameter<std::string>("client_id", "gps_bridge");
+    this->declare_parameter<std::string>("broker_address", "183.111.206.213");
+    this->declare_parameter<int>("broker_port", 2219);
+    this->declare_parameter<std::string>("topic_name", "status");
+    this->declare_parameter<std::string>("client_id", "ros2_gps_mqtt_node");
 
-    RCLCPP_INFO(this->get_logger(), "broker: %s:%d", broker_address_.c_str(), broker_port_);
-    RCLCPP_INFO(this->get_logger(), "mqtt_topic: %s", mqtt_topic_.c_str());
+    broker_address_ = this->get_parameter("broker_address").as_string();
+    broker_port_ = this->get_parameter("broker_port").as_int();
+    topic_name_ = this->get_parameter("topic_name").as_string();
+    client_id_ = this->get_parameter("client_id").as_string();
 
     mosquitto_lib_init();
-
-    mosq_ = mosquitto_new(client_id_.c_str(), true, this);
+    mosq_ = mosquitto_new(client_id_.c_str(), true, nullptr);
     if (!mosq_) {
-      RCLCPP_FATAL(this->get_logger(), "Failed to create mosquitto client");
       throw std::runtime_error("mosquitto_new failed");
     }
 
-    mosquitto_connect_callback_set(mosq_, on_connect_wrapper);
-
     int rc = mosquitto_connect(mosq_, broker_address_.c_str(), broker_port_, 60);
     if (rc != MOSQ_ERR_SUCCESS) {
-      RCLCPP_FATAL(this->get_logger(), "Connection failed: %s", mosquitto_strerror(rc));
-      throw std::runtime_error("mosquitto_connect failed");
+      std::ostringstream oss;
+      oss << "mosquitto_connect failed: " << mosquitto_strerror(rc);
+      throw std::runtime_error(oss.str());
     }
 
-    mosquitto_loop_start(mosq_);
-
-    // 🔥 ROS2 subscriber
-    sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
+    // 1) 위치
+    fix_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
       "/ublox_gps_node/fix",
       10,
-      std::bind(&GpsToMqttNode::callback, this, std::placeholders::_1));
+      std::bind(&GpsToMqttNode::fixCallback, this, std::placeholders::_1));
 
-    RCLCPP_INFO(this->get_logger(), "GPS → MQTT bridge started");
+    // 2) 속도 (ROS driver 가공본)
+    vel_sub_ = this->create_subscription<geometry_msgs::msg::TwistWithCovarianceStamped>(
+      "/ublox_gps_node/fix_velocity",
+      10,
+      std::bind(&GpsToMqttNode::velCallback, this, std::placeholders::_1));
+
+    // 3) heading + ground speed (u-blox NAV-PVT)
+    navpvt_sub_ = this->create_subscription<ublox_msgs::msg::NavPVT>(
+      "/ublox_gps_node/navpvt",
+      10,
+      std::bind(&GpsToMqttNode::navpvtCallback, this, std::placeholders::_1));
+
+    RCLCPP_INFO(this->get_logger(), "gps_to_mqtt_node started");
   }
 
-  ~GpsToMqttNode()
+  ~GpsToMqttNode() override
   {
     if (mosq_) {
-      mosquitto_loop_stop(mosq_, true);
       mosquitto_disconnect(mosq_);
       mosquitto_destroy(mosq_);
+      mosq_ = nullptr;
     }
     mosquitto_lib_cleanup();
   }
 
 private:
-  static void on_connect_wrapper(struct mosquitto *mosq, void *obj, int rc)
+  // -----------------------------
+  // Subscribers
+  // -----------------------------
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr fix_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr vel_sub_;
+  rclcpp::Subscription<ublox_msgs::msg::NavPVT>::SharedPtr navpvt_sub_;
+
+  // -----------------------------
+  // MQTT
+  // -----------------------------
+  struct mosquitto *mosq_{nullptr};
+  std::string broker_address_;
+  int broker_port_;
+  std::string topic_name_;
+  std::string client_id_;
+
+  // -----------------------------
+  // Latest data
+  // -----------------------------
+  double latitude_{0.0};
+  double longitude_{0.0};
+  double altitude_{0.0};
+
+  double vel_x_{0.0};
+  double vel_y_{0.0};
+  double vel_z_{0.0};
+  double speed_mps_{0.0};
+
+  double ground_speed_mps_{0.0};
+  double heading_deg_{0.0};       // heading of motion
+  double vehicle_heading_deg_{0.0}; // headVeh
+  int fix_type_{0};
+
+  bool has_fix_{false};
+  bool has_vel_{false};
+  bool has_navpvt_{false};
+
+  void fixCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg)
   {
-    if (rc == 0) {
-      RCLCPP_INFO(rclcpp::get_logger("gps_to_mqtt"), "Connected to MQTT broker");
-    } else {
-      RCLCPP_ERROR(rclcpp::get_logger("gps_to_mqtt"), "Connect failed: %s", mosquitto_strerror(rc));
-    }
+    latitude_ = msg->latitude;
+    longitude_ = msg->longitude;
+    altitude_ = msg->altitude;
+    has_fix_ = true;
+
+    publishCombined();
   }
 
-  void callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg)
+  void velCallback(const geometry_msgs::msg::TwistWithCovarianceStamped::SharedPtr msg)
   {
-    double lat = msg->latitude;
-    double lon = msg->longitude;
+    vel_x_ = msg->twist.twist.linear.x;
+    vel_y_ = msg->twist.twist.linear.y;
+    vel_z_ = msg->twist.twist.linear.z;
 
-    // 🔥 JSON 생성
-    std::stringstream ss;
-    ss << "{"
-       << "\"lat\":" << lat << ","
-       << "\"lon\":" << lon
-       << "}";
+    speed_mps_ = std::sqrt(
+      vel_x_ * vel_x_ +
+      vel_y_ * vel_y_ +
+      vel_z_ * vel_z_);
 
-    std::string payload = ss.str();
+    has_vel_ = true;
 
-    RCLCPP_INFO(this->get_logger(), "GPS → MQTT: %s", payload.c_str());
+    publishCombined();
+  }
+
+  void navpvtCallback(const ublox_msgs::msg::NavPVT::SharedPtr msg)
+  {
+    // NavPVT.gSpeed 는 mm/s
+    ground_speed_mps_ = static_cast<double>(msg->g_speed) / 1000.0;
+
+    // heading, headVeh 는 deg / 1e-5
+    heading_deg_ = static_cast<double>(msg->heading) / 100000.0;
+    vehicle_heading_deg_ = static_cast<double>(msg->head_veh) / 100000.0;
+
+    fix_type_ = msg->fix_type;
+    has_navpvt_ = true;
+
+    publishCombined();
+  }
+
+  std::string makeJson() const
+  {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(8);
+
+    oss << "{";
+    oss << "\"latitude\":" << latitude_ << ",";
+    oss << "\"longitude\":" << longitude_ << ",";
+    //oss << "\"altitude\":" << altitude_ << ",";
+
+    //oss << "\"vel_x_mps\":" << vel_x_ << ",";
+    //oss << "\"vel_y_mps\":" << vel_y_ << ",";
+    //oss << "\"vel_z_mps\":" << vel_z_ << ",";
+    //oss << "\"speed_mps\":" << speed_mps_ << ",";
+
+    oss << "\"ground_speed_mps\":" << ground_speed_mps_ << ",";
+    oss << "\"heading_deg\":" << heading_deg_ << ",";
+    //oss << "\"vehicle_heading_deg\":" << vehicle_heading_deg_ << ",";
+    oss << "\"fix_type\":" << fix_type_;
+
+    oss << "}";
+    return oss.str();
+  }
+
+  void publishCombined()
+  {
+    if (!has_fix_) {
+      return;
+    }
+
+    std::string payload = makeJson();
 
     int rc = mosquitto_publish(
       mosq_,
       nullptr,
-      mqtt_topic_.c_str(),
-      payload.size(),
+      topic_name_.c_str(),
+      static_cast<int>(payload.size()),
       payload.c_str(),
-      qos_level_,
+      0,
       false);
 
     if (rc != MOSQ_ERR_SUCCESS) {
-      RCLCPP_ERROR(this->get_logger(), "Publish error: %s", mosquitto_strerror(rc));
+      RCLCPP_ERROR(this->get_logger(), "mosquitto_publish failed: %s", mosquitto_strerror(rc));
+      return;
     }
+
+    RCLCPP_INFO(this->get_logger(), "Published: %s", payload.c_str());
+    mosquitto_loop(mosq_, 0, 1);
   }
-
-  struct mosquitto *mosq_;
-  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr sub_;
-
-  std::string broker_address_;
-  int broker_port_;
-  std::string mqtt_topic_;
-  int qos_level_;
-  std::string client_id_;
 };
 
-int main(int argc, char **argv)
+int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<GpsToMqttNode>();
-  rclcpp::spin(node);
+  try {
+    auto node = std::make_shared<GpsToMqttNode>();
+    rclcpp::spin(node);
+  } catch (const std::exception & e) {
+    fprintf(stderr, "Exception: %s\n", e.what());
+  }
   rclcpp::shutdown();
   return 0;
 }
